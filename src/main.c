@@ -22,6 +22,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <string.h>
+#include <stdint.h>
 #include <libusb.h>
 
 #include "stlink.h"
@@ -33,8 +35,71 @@ void print_help(char *argv[]) {
   printf("Usage: %s [options] [firmware.bin]\n", argv[0]);
   printf("Options:\n");
   printf("\t-p\tProbe the ST-Link adapter\n");
+  printf("\t-l\tTarget ST-Link by USB location, e.g. -l 1-2\n");
   printf("\t-h\tShow help\n\n");
   printf("\tApplication is started when called without argument or after firmware load\n\n");
+}
+
+static libusb_device_handle *open_stlink(libusb_context *ctx, const char *loc) {
+  libusb_device **list = NULL;
+  ssize_t n = libusb_get_device_list(ctx, &list);
+  libusb_device_handle *h = NULL;
+  int matches = 0;
+  int want_bus = -1, want_nports = 0;
+  uint8_t want_ports[8];
+
+  if (loc) {
+    want_bus = atoi(loc);
+    const char *dash = strchr(loc, '-');
+    if (dash) {
+      char buf[64];
+      strncpy(buf, dash + 1, sizeof(buf) - 1);
+      buf[sizeof(buf) - 1] = '\0';
+      char *tok = strtok(buf, ".");
+      while (tok && want_nports < 8) {
+        want_ports[want_nports++] = (uint8_t)atoi(tok);
+        tok = strtok(NULL, ".");
+      }
+    }
+  }
+
+  for (ssize_t i = 0; i < n; i++) {
+    struct libusb_device_descriptor desc;
+    if (libusb_get_device_descriptor(list[i], &desc)) continue;
+    if (desc.idVendor != STLINK_VID || desc.idProduct != STLINK_PID) continue;
+
+    int bus = libusb_get_bus_number(list[i]);
+    uint8_t ports[8];
+    int np = libusb_get_port_numbers(list[i], ports, 8);
+
+    if (loc) {
+      if (bus != want_bus || np != want_nports) continue;
+      int ok = 1;
+      for (int k = 0; k < np; k++) if (ports[k] != want_ports[k]) ok = 0;
+      if (!ok) continue;
+    }
+
+    matches++;
+    printf("ST-Link at %d-", bus);
+    for (int k = 0; k < np; k++) printf("%s%d", k ? "." : "", ports[k]);
+    printf("\n");
+
+    if (!h) {
+      if (libusb_open(list[i], &h)) h = NULL;
+    }
+  }
+
+  libusb_free_device_list(list, 1);
+
+  if (!loc && matches > 1) {
+    fprintf(stderr, "Multiple ST-Links present (%d). Refusing to guess; pass -l <bus-port> (e.g. -l 1-2).\n", matches);
+    if (h) libusb_close(h);
+    return NULL;
+  }
+  if (matches == 0) {
+    fprintf(stderr, "No matching ST-Link found%s%s.\n", loc ? " at location " : "", loc ? loc : "");
+  }
+  return h;
 }
 
 int main(int argc, char *argv[]) {
@@ -42,11 +107,15 @@ int main(int argc, char *argv[]) {
   libusb_device_handle *dev_handle;
   struct STLinkInfos infos;
   int res, i, opt, probe = 0;
+  char *location = NULL;
 
-  while ((opt = getopt(argc, argv, "hp")) != -1) {
+  while ((opt = getopt(argc, argv, "hpl:")) != -1) {
     switch (opt) {
     case 'p': /* Probe mode */
       probe = 1;
+      break;
+    case 'l': /* Target USB location bus-port[.port...] */
+      location = optarg;
       break;
     case 'h': /* Help */
       print_help(argv);
@@ -64,11 +133,8 @@ int main(int argc, char *argv[]) {
   res = libusb_init(&usb_ctx);
   (void)res;
 
-  dev_handle = libusb_open_device_with_vid_pid(usb_ctx,
-					       STLINK_VID,
-					       STLINK_PID);
+  dev_handle = open_stlink(usb_ctx, location);
   if (!dev_handle) {
-    fprintf(stderr, "No ST-Link in DFU mode found. Replug ST-Link to flash!\n");
     return EXIT_FAILURE;
   }
 
